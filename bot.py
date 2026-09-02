@@ -1,4 +1,3 @@
-
 import os
 import json
 import logging
@@ -67,16 +66,19 @@ ws_clientes = sh.worksheet("Clientes")
 _cache = {}
 _cache_time = {}
 
-def get_sheet_data(sheet_name):
+def get_sheet_data(sheet_name, force=False):
     now = time.time()
-    if sheet_name in _cache and (now - _cache_time.get(sheet_name, 0)) < CACHE_TTL:
+    if not force and sheet_name in _cache and (now - _cache_time.get(sheet_name, 0)) < CACHE_TTL:
         return _cache[sheet_name]
+    t0 = time.time()
     if sheet_name == "Reclamos":
         data = ws_reclamos.get_all_records()
     else:
         data = ws_clientes.get_all_records()
     _cache[sheet_name] = data
     _cache_time[sheet_name] = now
+    elapsed = time.time() - t0
+    logger.info(f"📡 {sheet_name} recargado: {len(data)} registros ({elapsed:.1f}s)")
     return data
 
 def clear_cache():
@@ -198,10 +200,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <b>/resumen</b> — Resumen de hoy\n"
         "• <b>/pendientes</b> — Lista completa de pendientes\n"
         "• <b>/topmes</b> — Ranking técnicos últimos 30 días\n"
-        "• <b>/mapa</b> &lt;sector&gt; — Mapa de reclamos por sector\n\n"
+        "• <b>/mapa</b> &lt;sector&gt; — Mapa de reclamos por sector\n"
+        "• <b>/actualizar</b> — Forzar recarga de datos del Sheet\n\n"
         "Ejemplo: <code>/cliente 6331</code>"
     )
     await update.message.reply_text(text, parse_mode="HTML")
+
+async def actualizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fuerza la recarga de datos desde Google Sheets"""
+    msg = await update.message.reply_text("🔄 <b>Actualizando datos...</b>", parse_mode="HTML")
+    try:
+        clear_cache()
+        reclamos = get_sheet_data("Reclamos", force=True)
+        clientes = get_sheet_data("Clientes", force=True)
+        ahora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        respuesta = (
+            f"✅ <b>Datos actualizados</b>\n\n"
+            f"├ <b>Fecha:</b> {ahora}\n"
+            f"├ <b>Reclamos:</b> {len(reclamos)} registros\n"
+            f"├ <b>Clientes:</b> {len(clientes)} registros\n"
+            f"└ <b>Cache TTL:</b> {CACHE_TTL}s\n\n"
+            f"<i>Los próximos {CACHE_TTL}s usarán estos datos.</i>"
+        )
+        await msg.edit_text(respuesta, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Error al actualizar: {e}")
+        await msg.edit_text(f"❌ <b>Error al actualizar:</b> {e}", parse_mode="HTML")
 
 async def cliente(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -525,17 +549,8 @@ async def mapa(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== MAIN ====================
 def main():
-    # ✅ CAMBIO 1: drop_pending_updates limpia cola al iniciar (evita conflict)
-    # ✅ CAMBIO 2: poll_interval más largo = menos chance de conflict
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .drop_pending_updates(True)
-        .poll_interval(2.0)
-        .build()
-    )
+    application = Application.builder().token(BOT_TOKEN).build()
 
-    # ✅ CAMBIO 3: Registrar error handler para silenciar Conflict
     application.add_error_handler(error_handler)
 
     application.add_handler(CommandHandler("start", start))
@@ -551,13 +566,17 @@ def main():
     application.add_handler(CommandHandler("pendientes", pendientes))
     application.add_handler(CommandHandler("topmes", topmes))
     application.add_handler(CommandHandler("mapa", mapa))
+    application.add_handler(CommandHandler("actualizar", actualizar))
 
     if os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_HOSTNAME"):
         logger.info("🚀 Modo Render detectado. Iniciando servidor de health-check...")
         threading.Thread(target=run_web_server, daemon=True).start()
 
     logger.info("🤖 Bot iniciado. Esperando mensajes...")
-    application.run_polling()
+    application.run_polling(
+        drop_pending_updates=True,
+        poll_interval=2.0
+    )
 
 if __name__ == "__main__":
     main()
