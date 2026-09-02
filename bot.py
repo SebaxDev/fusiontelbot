@@ -4,7 +4,7 @@ import logging
 import threading
 from flask import Flask
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -20,7 +20,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== MINI SERVIDOR WEB (para Render) ====================
-# Esto evita que Render "duerma" el servicio porque siempre hay un puerto activo
 app = Flask(__name__)
 
 @app.route("/")
@@ -37,11 +36,11 @@ def get_google_client():
     if not creds_json:
         raise ValueError("Falta la variable de entorno GOOGLE_CREDENTIALS_JSON")
     creds_dict = json.loads(creds_json)
-    scope = [
-        "https://spreadsheets.google.com/feeds",
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     return gspread.authorize(credentials)
 
 gc = get_google_client()
@@ -316,7 +315,6 @@ def main():
     application.add_handler(CommandHandler("nombre", nombre_cmd))
     application.add_handler(CommandHandler("recientes", recientes))
     
-    # Si estamos en Render, iniciar servidor web en paralelo para health-check
     if os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_HOSTNAME"):
         logger.info("🚀 Modo Render detectado. Iniciando servidor de health-check...")
         threading.Thread(target=run_web_server, daemon=True).start()
