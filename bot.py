@@ -25,6 +25,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ==================== ERROR HANDLER ====================
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Silencia el error Conflict (múltiples instancias durante deploy)"""
+    from telegram.error import Conflict
+    if isinstance(context.error, Conflict):
+        logger.warning("⚠️ Conflict detectado (otra instancia activa). Reintentando...")
+        return
+    logger.error(f"❌ Error no manejado: {context.error}", exc_info=context.error)
+
 # ==================== MINI SERVIDOR WEB (para Render) ====================
 app = Flask(__name__)
 
@@ -516,7 +525,18 @@ async def mapa(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== MAIN ====================
 def main():
-    application = Application.builder().token(BOT_TOKEN).build()
+    # ✅ CAMBIO 1: drop_pending_updates limpia cola al iniciar (evita conflict)
+    # ✅ CAMBIO 2: poll_interval más largo = menos chance de conflict
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .drop_pending_updates(True)
+        .poll_interval(2.0)
+        .build()
+    )
+
+    # ✅ CAMBIO 3: Registrar error handler para silenciar Conflict
+    application.add_error_handler(error_handler)
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("cliente", cliente))
