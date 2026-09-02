@@ -3,6 +3,7 @@ import json
 import logging
 import threading
 import time
+import asyncio
 from datetime import datetime, timedelta
 from collections import Counter
 from io import BytesIO
@@ -73,7 +74,6 @@ def get_sheet_data(sheet_name, force=False):
     t0 = time.time()
     ws = ws_reclamos if sheet_name == "Reclamos" else ws_clientes
 
-    # Usar values_get directo al API para saltar cache interno de gspread
     try:
         result = ws.spreadsheet.values_get(
             ws.title,
@@ -81,7 +81,6 @@ def get_sheet_data(sheet_name, force=False):
         )
         values = result.get("values", [])
     except Exception:
-        # Fallback si falla el método directo
         values = ws.get_all_values()
 
     if values and len(values) > 1:
@@ -102,7 +101,6 @@ def get_sheet_data(sheet_name, force=False):
     return data
 
 def force_refresh():
-    """Reabre el spreadsheet por completo para invalidar todo cache"""
     global sh, ws_reclamos, ws_clientes
     clear_cache()
     sh = gc.open_by_key(SPREADSHEET_ID)
@@ -148,10 +146,10 @@ def tiene_tecnico(row):
     t = safe_str(row.get("Técnico"))
     return t != "" and t.lower() not in ("base", "oficina", "sin técnico")
 
-def send_long_message(update, text, parse_mode="HTML", **kwargs):
+async def send_long_message(update, text, parse_mode="HTML", **kwargs):
     max_len = 4000
     if len(text) <= max_len:
-        return update.message.reply_text(text, parse_mode=parse_mode, **kwargs)
+        return await update.message.reply_text(text, parse_mode=parse_mode, **kwargs)
     parts = []
     while text:
         if len(text) <= max_len:
@@ -166,7 +164,7 @@ def send_long_message(update, text, parse_mode="HTML", **kwargs):
         text = text[idx:].lstrip()
     for i, part in enumerate(parts):
         suffix = "\n\n<i>...continúa...</i>" if i < len(parts) - 1 else ""
-        update.message.reply_text(part + suffix, parse_mode=parse_mode, **kwargs)
+        await update.message.reply_text(part + suffix, parse_mode=parse_mode, **kwargs)
 
 def format_cliente(row):
     nombre = safe_str(row.get("Nombre"))
@@ -236,14 +234,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML")
 
 async def actualizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fuerza la recarga completa desde Google Sheets"""
     msg = await update.message.reply_text("🔄 <b>Actualizando datos...</b>", parse_mode="HTML")
     try:
-        # Reabrir spreadsheet por completo para romper cache de Google
         force_refresh()
-        # Esperar un momento para que el cache de Google se actualice
         await asyncio.sleep(1)
-        # Forzar lectura con el método directo al API
         reclamos = get_sheet_data("Reclamos", force=True)
         clientes = get_sheet_data("Clientes", force=True)
 
@@ -268,7 +262,6 @@ async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hoy_reclamos = [r for r in reclamos if is_today(safe_str(r.get("Fecha y hora")))]
     generados = len(hoy_reclamos)
 
-    # Clasificación clara: cada reclamo cae en UNA sola categoría
     resueltos = 0
     en_curso = 0
     pendientes = 0
@@ -282,7 +275,6 @@ async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             pendientes += 1
 
-    # Info de cache para que sepás si estás viendo datos frescos
     cache_age = int(time.time() - _cache_time.get("Reclamos", 0))
     if cache_age < 5:
         cache_str = "ahora mismo"
@@ -300,7 +292,6 @@ async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"└ <b>⏳ Pendientes:</b> {pendientes}\n"
     )
 
-    # Verificación: la suma tiene que dar generados
     suma = resueltos + en_curso + pendientes
     if suma != generados:
         msg += f"\n⚠️ <i>Atención: {generados - suma} reclamo(s) con estado no reconocido. "
@@ -335,7 +326,7 @@ async def cliente(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg += "<i>Sin reclamos registrados.</i>\n"
 
-    send_long_message(update, msg, disable_web_page_preview=True)
+    await send_long_message(update, msg, disable_web_page_preview=True)
 
 async def precinto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -353,7 +344,7 @@ async def precinto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"<b>🏷️ Precinto {p}</b>\n\n"
     for c in found:
         msg += format_cliente(c) + "\n"
-    send_long_message(update, msg[:4000], disable_web_page_preview=True)
+    await send_long_message(update, msg[:4000], disable_web_page_preview=True)
 
 async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -374,7 +365,7 @@ async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, r in enumerate(historial, 1):
         msg += format_reclamo(r, i) + "\n"
 
-    send_long_message(update, msg)
+    await send_long_message(update, msg)
 
 async def ubicacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -466,7 +457,7 @@ async def tecnico(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg += "<b>✅ Resueltos:</b> <i>Ninguno</i>\n"
 
-    send_long_message(update, msg)
+    await send_long_message(update, msg)
 
 async def nombre_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -484,7 +475,7 @@ async def nombre_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"<b>🔍 Resultados ({len(found)}):</b>\n\n"
     for c in found[:5]:
         msg += format_cliente(c) + "\n"
-    send_long_message(update, msg[:4000], disable_web_page_preview=True)
+    await send_long_message(update, msg[:4000], disable_web_page_preview=True)
 
 async def recientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -500,7 +491,7 @@ async def recientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"<b>📅 Últimos {n} reclamos:</b>\n\n"
     for i, r in enumerate(ultimos, 1):
         msg += format_reclamo(r, i, show_cliente=True) + "\n"
-    send_long_message(update, msg)
+    await send_long_message(update, msg)
 
 async def pendientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reclamos = get_sheet_data("Reclamos")
@@ -523,7 +514,7 @@ async def pendientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"   📍 {direccion}\n"
         msg += f"   🏷️ {tipo} | 📅 {fecha}\n\n"
 
-    send_long_message(update, msg)
+    await send_long_message(update, msg)
 
 async def topmes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reclamos = get_sheet_data("Reclamos")
@@ -609,8 +600,6 @@ async def mapa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_photo(photo=buf, caption=f"🗺️ <b>Mapa Sector {sector}</b>\n{len(puntos)} puntos cargados.")
 
 # ==================== MAIN ====================
-import asyncio
-
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
