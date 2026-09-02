@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 # ==================== ERROR HANDLER ====================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Silencia el error Conflict (múltiples instancias durante deploy)"""
     from telegram.error import Conflict
     if isinstance(context.error, Conflict):
         logger.warning("⚠️ Conflict detectado (otra instancia activa). Reintentando...")
@@ -70,16 +69,46 @@ def get_sheet_data(sheet_name, force=False):
     now = time.time()
     if not force and sheet_name in _cache and (now - _cache_time.get(sheet_name, 0)) < CACHE_TTL:
         return _cache[sheet_name]
+
     t0 = time.time()
-    if sheet_name == "Reclamos":
-        data = ws_reclamos.get_all_records()
+    ws = ws_reclamos if sheet_name == "Reclamos" else ws_clientes
+
+    # Usar values_get directo al API para saltar cache interno de gspread
+    try:
+        result = ws.spreadsheet.values_get(
+            ws.title,
+            params={"dateTimeRenderOption": "FORMATTED_STRING"}
+        )
+        values = result.get("values", [])
+    except Exception:
+        # Fallback si falla el método directo
+        values = ws.get_all_values()
+
+    if values and len(values) > 1:
+        headers = [str(h).strip() if h else "" for h in values[0]]
+        data = []
+        for row in values[1:]:
+            record = {}
+            for i, header in enumerate(headers):
+                record[header] = row[i] if i < len(row) else ""
+            data.append(record)
     else:
-        data = ws_clientes.get_all_records()
+        data = []
+
     _cache[sheet_name] = data
     _cache_time[sheet_name] = now
     elapsed = time.time() - t0
     logger.info(f"📡 {sheet_name} recargado: {len(data)} registros ({elapsed:.1f}s)")
     return data
+
+def force_refresh():
+    """Reabre el spreadsheet por completo para invalidar todo cache"""
+    global sh, ws_reclamos, ws_clientes
+    clear_cache()
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    ws_reclamos = sh.worksheet("Reclamos")
+    ws_clientes = sh.worksheet("Clientes")
+    logger.info("🔄 Spreadsheet reabierto forzando refresh")
 
 def clear_cache():
     _cache.clear()
@@ -90,7 +119,7 @@ def safe_str(value):
     if value is None:
         return ""
     s = str(value).strip()
-    if s.lower() in ("nan", "none", "null", "nat"):
+    if s.lower() in ("nan", "none", "null", "nat", "*", "—"):
         return ""
     return s
 
@@ -207,25 +236,77 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML")
 
 async def actualizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fuerza la recarga de datos desde Google Sheets"""
+    """Fuerza la recarga completa desde Google Sheets"""
     msg = await update.message.reply_text("🔄 <b>Actualizando datos...</b>", parse_mode="HTML")
     try:
-        clear_cache()
+        # Reabrir spreadsheet por completo para romper cache de Google
+        force_refresh()
+        # Esperar un momento para que el cache de Google se actualice
+        await asyncio.sleep(1)
+        # Forzar lectura con el método directo al API
         reclamos = get_sheet_data("Reclamos", force=True)
         clientes = get_sheet_data("Clientes", force=True)
+
         ahora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         respuesta = (
             f"✅ <b>Datos actualizados</b>\n\n"
             f"├ <b>Fecha:</b> {ahora}\n"
             f"├ <b>Reclamos:</b> {len(reclamos)} registros\n"
             f"├ <b>Clientes:</b> {len(clientes)} registros\n"
-            f"└ <b>Cache TTL:</b> {CACHE_TTL}s\n\n"
-            f"<i>Los próximos {CACHE_TTL}s usarán estos datos.</i>"
+            f"└ <b>Cache:</b> {CACHE_TTL}s\n\n"
+            f"<i>Ahora usá /resumen para ver datos frescos.</i>"
         )
         await msg.edit_text(respuesta, parse_mode="HTML")
     except Exception as e:
         logger.error(f"Error al actualizar: {e}")
         await msg.edit_text(f"❌ <b>Error al actualizar:</b> {e}", parse_mode="HTML")
+
+async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reclamos = get_sheet_data("Reclamos")
+    hoy = datetime.now().date()
+
+    hoy_reclamos = [r for r in reclamos if is_today(safe_str(r.get("Fecha y hora")))]
+    generados = len(hoy_reclamos)
+
+    # Clasificación clara: cada reclamo cae en UNA sola categoría
+    resueltos = 0
+    en_curso = 0
+    pendientes = 0
+
+    for r in hoy_reclamos:
+        estado = safe_str(r.get("Estado")).lower()
+        if estado == "resuelto":
+            resueltos += 1
+        elif tiene_tecnico(r):
+            en_curso += 1
+        else:
+            pendientes += 1
+
+    # Info de cache para que sepás si estás viendo datos frescos
+    cache_age = int(time.time() - _cache_time.get("Reclamos", 0))
+    if cache_age < 5:
+        cache_str = "ahora mismo"
+    elif cache_age < 60:
+        cache_str = f"hace {cache_age}s"
+    else:
+        cache_str = f"hace {cache_age // 60}min {cache_age % 60}s"
+
+    msg = (
+        f"<b>📊 Resumen del día — {hoy.strftime('%d/%m/%Y')}</b>\n"
+        f"<i>🕐 Datos: {cache_str}</i>\n\n"
+        f"├ <b>📝 Generados hoy:</b> {generados}\n"
+        f"├ <b>✅ Resueltos:</b> {resueltos}\n"
+        f"├ <b>🔧 En curso:</b> {en_curso}\n"
+        f"└ <b>⏳ Pendientes:</b> {pendientes}\n"
+    )
+
+    # Verificación: la suma tiene que dar generados
+    suma = resueltos + en_curso + pendientes
+    if suma != generados:
+        msg += f"\n⚠️ <i>Atención: {generados - suma} reclamo(s) con estado no reconocido. "
+        msg += f"Usá /actualizar antes de consultar.</i>"
+
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 async def cliente(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -366,8 +447,8 @@ async def tecnico(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ No hay reclamos asignados a <b>{nombre}</b>.", parse_mode="HTML")
         return
 
-    en_curso = [r for r in found if safe_str(r.get("Estado")) != "Resuelto"]
-    verificados = [r for r in found if safe_str(r.get("Estado")) == "Resuelto"]
+    en_curso = [r for r in found if safe_str(r.get("Estado")).lower() != "resuelto"]
+    verificados = [r for r in found if safe_str(r.get("Estado")).lower() == "resuelto"]
 
     msg = f"<b>👷 Reclamos de {nombre}</b>\n\n"
 
@@ -379,11 +460,11 @@ async def tecnico(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += "<b>🔧 En curso:</b> <i>Ninguno</i>\n\n"
 
     if verificados:
-        msg += f"<b>✅ Verificados ({len(verificados)}):</b>\n\n"
+        msg += f"<b>✅ Resueltos ({len(verificados)}):</b>\n\n"
         for i, r in enumerate(verificados[-5:], 1):
             msg += format_reclamo(r, i) + "\n"
     else:
-        msg += "<b>✅ Verificados:</b> <i>Ninguno</i>\n"
+        msg += "<b>✅ Resueltos:</b> <i>Ninguno</i>\n"
 
     send_long_message(update, msg)
 
@@ -421,29 +502,9 @@ async def recientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += format_reclamo(r, i, show_cliente=True) + "\n"
     send_long_message(update, msg)
 
-async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reclamos = get_sheet_data("Reclamos")
-    hoy = datetime.now().date()
-
-    hoy_reclamos = [r for r in reclamos if is_today(safe_str(r.get("Fecha y hora")))]
-
-    generados = len(hoy_reclamos)
-    en_curso = len([r for r in hoy_reclamos if tiene_tecnico(r) and safe_str(r.get("Estado")) != "Resuelto"])
-    verificados = len([r for r in hoy_reclamos if safe_str(r.get("Estado")) == "Resuelto"])
-    pendientes = len([r for r in hoy_reclamos if not tiene_tecnico(r) and safe_str(r.get("Estado")) != "Resuelto"])
-
-    msg = (
-        f"<b>📊 Resumen del día — {hoy.strftime('%d/%m/%Y')}</b>\n\n"
-        f"├ <b>📝 Generados hoy:</b> {generados}\n"
-        f"├ <b>🔧 En curso:</b> {en_curso}\n"
-        f"├ <b>✅ Verificados:</b> {verificados}\n"
-        f"└ <b>⏳ Pendientes:</b> {pendientes}\n"
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
-
 async def pendientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reclamos = get_sheet_data("Reclamos")
-    pendientes_list = [r for r in reclamos if not tiene_tecnico(r) and safe_str(r.get("Estado")) != "Resuelto"]
+    pendientes_list = [r for r in reclamos if not tiene_tecnico(r) and safe_str(r.get("Estado")).lower() != "resuelto"]
 
     if not pendientes_list:
         await update.message.reply_text("✅ <b>No hay reclamos pendientes.</b>", parse_mode="HTML")
@@ -467,7 +528,7 @@ async def pendientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def topmes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reclamos = get_sheet_data("Reclamos")
 
-    resueltos = [r for r in reclamos if safe_str(r.get("Estado")) == "Resuelto" and is_last_30_days(safe_str(r.get("Fecha y hora")))]
+    resueltos = [r for r in reclamos if safe_str(r.get("Estado")).lower() == "resuelto" and is_last_30_days(safe_str(r.get("Fecha y hora")))]
 
     if not resueltos:
         await update.message.reply_text("📉 <b>No hay reclamos resueltos en los últimos 30 días.</b>", parse_mode="HTML")
@@ -532,7 +593,7 @@ async def mapa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fig, ax = plt.subplots(figsize=(10, 8))
 
     for lat, lon, estado in puntos:
-        color = "green" if estado == "Resuelto" else "orange" if estado else "red"
+        color = "green" if estado.lower() == "resuelto" else "orange" if estado else "red"
         ax.plot(lon, lat, marker='o', color=color, markersize=8)
 
     ax.set_title(f"Mapa Sector {sector} — {len(puntos)} puntos")
@@ -548,6 +609,8 @@ async def mapa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_photo(photo=buf, caption=f"🗺️ <b>Mapa Sector {sector}</b>\n{len(puntos)} puntos cargados.")
 
 # ==================== MAIN ====================
+import asyncio
+
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
