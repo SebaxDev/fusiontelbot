@@ -2,6 +2,8 @@ import os
 import json
 import logging
 import threading
+import time
+from datetime import datetime, timedelta
 from flask import Flask
 import gspread
 from google.oauth2.service_account import Credentials
@@ -48,6 +50,25 @@ sh = gc.open_by_key(SPREADSHEET_ID)
 ws_reclamos = sh.worksheet("Reclamos")
 ws_clientes = sh.worksheet("Clientes")
 
+# ==================== CACHE TTL ====================
+_cache = {}
+_cache_time = {}
+CACHE_TTL = 60  # segundos
+
+def get_cached_records(worksheet, cache_name):
+    now = time.time()
+    if cache_name in _cache and (now - _cache_time.get(cache_name, 0)) < CACHE_TTL:
+        return _cache[cache_name]
+    records = worksheet.get_all_records()
+    _cache[cache_name] = records
+    _cache_time[cache_name] = now
+    logger.info(f"🔄 Caché actualizado: {cache_name} ({len(records)} regs)")
+    return records
+
+def invalidate_cache():
+    _cache.clear()
+    _cache_time.clear()
+
 # ==================== HELPERS ====================
 def safe_str(value):
     if value is None:
@@ -56,6 +77,32 @@ def safe_str(value):
     if s.lower() in ("nan", "none", "null", "nat"):
         return ""
     return s
+
+def parse_fecha(fecha_str):
+    s = safe_str(fecha_str).strip()
+    if not s:
+        return None
+    for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+def classify_reclamo(row):
+    estado = safe_str(row.get("Estado")).lower().strip()
+    tecnico = safe_str(row.get("Técnico")).strip()
+    if estado == "resuelto":
+        return "verificado"
+    if estado in ("desconexión", "desconexion", "desconexion a pedido"):
+        return "desconexion"
+    if not tecnico:
+        return "pendiente"
+    if estado and estado not in ("resuelto", "desconexión", "desconexion"):
+        return "curso"
+    if not estado and tecnico:
+        return "curso"
+    return "pendiente"
 
 def format_cliente(row):
     nombre = safe_str(row.get("Nombre"))
@@ -66,21 +113,28 @@ def format_cliente(row):
     sector = safe_str(row.get("Sector"))
     lat = safe_str(row.get("Latitud"))
     lon = safe_str(row.get("Longitud"))
-    cliente_id = safe_str(row.get("ID Cliente"))
-    
-    html = f"<b>👤 Cliente #{safe_str(row.get('Nº Cliente'))}</b>\n"
-    html += f"├ <b>Nombre:</b> {nombre}\n"
-    html += f"├ <b>Dirección:</b> {direccion}\n"
-    html += f"├ <b>Teléfono:</b> {telefono or '—'}\n"
-    html += f"├ <b>Precinto:</b> {precinto or 'No asignado'}\n"
-    html += f"├ <b>Plan:</b> {plan or '—'}\n"
-    html += f"├ <b>Sector:</b> {sector or '—'}\n"
-    html += f"├ <b>ID Cliente:</b> <code>{cliente_id}</code>\n"
+
+    html = f"<b>👤 Cliente #{safe_str(row.get('Nº Cliente'))}</b>
+"
+    html += f"├ <b>Nombre:</b> {nombre}
+"
+    html += f"├ <b>Dirección:</b> {direccion}
+"
+    html += f"├ <b>Teléfono:</b> {telefono or '—'}
+"
+    html += f"├ <b>Precinto:</b> {precinto or 'No asignado'}
+"
+    html += f"├ <b>Plan:</b> {plan or '—'}
+"
+    html += f"├ <b>Sector:</b> {sector or '—'}
+"
     if lat and lon:
         maps_url = f"https://www.google.com/maps?q={lat},{lon}"
-        html += f"└ <b>📍 Ubicación:</b> <a href='{maps_url}'>Ver en Google Maps</a>\n"
+        html += f"└ <b>📍 Ubicación:</b> <a href='{maps_url}'>Ver en Google Maps</a>
+"
     else:
-        html += f"└ <b>📍 Ubicación:</b> No disponible\n"
+        html += f"└ <b>📍 Ubicación:</b> No disponible
+"
     return html
 
 def format_reclamo(row, idx=None):
@@ -90,237 +144,307 @@ def format_reclamo(row, idx=None):
     estado = safe_str(row.get("Estado"))
     tecnico = safe_str(row.get("Técnico"))
     detalles = safe_str(row.get("Detalles"))
-    rec_id = safe_str(row.get("ID Reclamo"))
-    
-    html = f"<b>{pref}{fecha}</b> | {tipo}\n"
-    html += f"├ <b>Estado:</b> {estado}\n"
-    html += f"├ <b>Técnico:</b> {tecnico or '—'}\n"
-    html += f"├ <b>ID:</b> <code>{rec_id}</code>\n"
+    num_cliente = safe_str(row.get("Nº Cliente"))
+    nombre = safe_str(row.get("Nombre"))
+
+    html = f"<b>{pref}{fecha}</b> | {tipo}
+"
+    html += f"├ <b>Cliente:</b> #{num_cliente} — {nombre}
+"
+    html += f"├ <b>Estado:</b> {estado or '—'}
+"
+    html += f"├ <b>Técnico:</b> {tecnico or '—'}
+"
     if detalles:
-        html += f"└ <b>Detalle:</b> {detalles[:80]}{'...' if len(detalles) > 80 else ''}\n"
+        html += f"└ <b>Detalle:</b> {detalles[:80]}{'...' if len(detalles) > 80 else ''}
+"
+    return html
+
+def format_reclamo_detalle(row, idx=None):
+    pref = f"{idx}. " if idx else ""
+    fecha = safe_str(row.get("Fecha y hora"))
+    tipo = safe_str(row.get("Tipo de reclamo"))
+    estado = safe_str(row.get("Estado"))
+    tecnico = safe_str(row.get("Técnico"))
+    detalles = safe_str(row.get("Detalles"))
+    num_cliente = safe_str(row.get("Nº Cliente"))
+    nombre = safe_str(row.get("Nombre"))
+    direccion = safe_str(row.get("Dirección"))
+    precinto = safe_str(row.get("N° de Precinto"))
+
+    html = f"<b>{pref}{fecha}</b> | {tipo}
+"
+    html += f"├ <b>Cliente:</b> #{num_cliente} — {nombre}
+"
+    html += f"├ <b>Dirección:</b> {direccion}
+"
+    html += f"├ <b>Estado:</b> {estado or '—'}
+"
+    html += f"├ <b>Técnico:</b> {tecnico or '—'}
+"
+    html += f"├ <b>Precinto:</b> {precinto or '—'}
+"
+    if detalles:
+        html += f"└ <b>Detalle:</b> {detalles[:120]}{'...' if len(detalles) > 120 else ''}
+"
     return html
 
 # ==================== COMANDOS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "👋 <b>Bot de Reclamos — Fusión</b>\n\n"
-        "Comandos disponibles:\n\n"
-        "• <b>/cliente</b> &lt;número&gt; — Ficha del cliente + historial\n"
-        "• <b>/precinto</b> &lt;número&gt; — Buscar cliente por precinto\n"
-        "• <b>/historial</b> &lt;número&gt; — Todos los reclamos de un cliente\n"
-        "• <b>/ubicacion</b> &lt;número&gt; — Link de Maps del cliente\n"
-        "• <b>/reclamo</b> &lt;ID&gt; — Buscar reclamo por ID\n"
-        "• <b>/tecnico</b> &lt;nombre&gt; — Reclamos de un técnico\n"
-        "• <b>/nombre</b> &lt;texto&gt; — Buscar cliente por nombre\n"
-        "• <b>/recientes</b> &lt;N&gt; — Últimos N reclamos\n\n"
+        "👋 <b>Bot de Reclamos — Fusión</b>
+
+"
+        "Comandos disponibles:
+
+"
+        "• <b>/cliente</b> &lt;número&gt; — Ficha del cliente + historial
+"
+        "• <b>/precinto</b> &lt;número&gt; — Buscar cliente por precinto
+"
+        "• <b>/historial</b> &lt;número&gt; — Todos los reclamos de un cliente
+"
+        "• <b>/ubicacion</b> &lt;número&gt; — Link de Maps del cliente
+"
+        "• <b>/reclamo</b> &lt;ID&gt; — Buscar reclamo por ID
+"
+        "• <b>/tecnico</b> &lt;nombre&gt; — Reclamos en curso y verificados de un técnico
+"
+        "• <b>/nombre</b> &lt;texto&gt; — Buscar cliente por nombre
+"
+        "• <b>/recientes</b> &lt;N&gt; — Últimos N reclamos
+"
+        "• <b>/resumen</b> — Resumen diario y totales
+"
+        "• <b>/pendientes</b> — Lista completa de reclamos pendientes
+"
+        "• <b>/topmes</b> — Ranking de técnicos últimos 30 días
+"
+        "• <b>/sectores</b> — Mapa de sectores con estadísticas
+
+"
         "Ejemplo: <code>/cliente 6331</code>"
     )
     await update.message.reply_text(text, parse_mode="HTML")
+
+async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reclamos = get_cached_records(ws_reclamos, "reclamos")
+    hoy = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    manana = hoy + timedelta(days=1)
+
+    generados_hoy = 0
+    total_curso = 0
+    total_verificado = 0
+    total_pendiente = 0
+    hoy_curso = 0
+    hoy_verificado = 0
+    hoy_pendiente = 0
+
+    for r in reclamos:
+        fecha = parse_fecha(safe_str(r.get("Fecha y hora")))
+        cat = classify_reclamo(r)
+
+        if fecha and hoy <= fecha < manana:
+            generados_hoy += 1
+            if cat == "curso":
+                hoy_curso += 1
+            elif cat == "verificado":
+                hoy_verificado += 1
+            elif cat == "pendiente":
+                hoy_pendiente += 1
+
+        if cat == "curso":
+            total_curso += 1
+        elif cat == "verificado":
+            total_verificado += 1
+        elif cat == "pendiente":
+            total_pendiente += 1
+
+    msg = (
+        f"<b>📊 Resumen General</b>
+
+"
+        f"<b>📅 Hoy ({hoy.strftime('%d/%m/%Y')}):</b>
+"
+        f"├ Generados: <b>{generados_hoy}</b>
+"
+        f"├ 🔧 En curso: <b>{hoy_curso}</b>
+"
+        f"├ ✅ Verificados: <b>{hoy_verificado}</b>
+"
+        f"└ ⏳ Pendientes: <b>{hoy_pendiente}</b>
+
+"
+        f"<b>📈 Totales activos:</b>
+"
+        f"├ 🔧 En curso: <b>{total_curso}</b>
+"
+        f"├ ✅ Verificados: <b>{total_verificado}</b>
+"
+        f"└ ⏳ Pendientes: <b>{total_pendiente}</b>"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 async def cliente(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("⚠️ Usá: <code>/cliente 6331</code>", parse_mode="HTML")
         return
-    
+
     num = safe_str(context.args[0])
-    clientes = ws_clientes.get_all_records()
-    reclamos = ws_reclamos.get_all_records()
-    
+    clientes = get_cached_records(ws_clientes, "clientes")
+    reclamos = get_cached_records(ws_reclamos, "reclamos")
+
     cliente_row = next((c for c in clientes if safe_str(c.get("Nº Cliente")) == num), None)
     if not cliente_row:
         await update.message.reply_text(f"❌ Cliente <b>#{num}</b> no encontrado.", parse_mode="HTML")
         return
-    
+
     historial = [r for r in reclamos if safe_str(r.get("Nº Cliente")) == num]
     total_reclamos = len(historial)
     historial = historial[-5:]
     historial.reverse()
-    
+
     msg = format_cliente(cliente_row)
-    msg += f"\n<b>📋 Historial ({len(historial)} de {total_reclamos}):</b>\n\n"
+    msg += f"
+<b>📋 Historial ({len(historial)} de {total_reclamos}):</b>
+
+"
     if historial:
         for i, r in enumerate(historial, 1):
-            msg += format_reclamo(r, i) + "\n"
+            msg += format_reclamo(r, i) + "
+"
     else:
-        msg += "<i>Sin reclamos registrados.</i>\n"
-    
+        msg += "<i>Sin reclamos registrados.</i>
+"
+
     if len(msg) > 4000:
-        msg = msg[:4000] + "\n\n<i>... mensaje truncado</i>"
+        msg = msg[:4000] + "
+
+<i>... mensaje truncado</i>"
     await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
 
 async def precinto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("⚠️ Usá: <code>/precinto 4209200</code>", parse_mode="HTML")
         return
-    
+
     p = safe_str(context.args[0])
-    clientes = ws_clientes.get_all_records()
+    clientes = get_cached_records(ws_clientes, "clientes")
     found = [c for c in clientes if safe_str(c.get("N° de Precinto")) == p]
-    
+
     if not found:
         await update.message.reply_text(f"❌ Precinto <code>{p}</code> no asignado a ningún cliente.", parse_mode="HTML")
         return
-    
-    msg = f"<b>🏷️ Precinto {p}</b>\n\n"
+
+    msg = f"<b>🏷️ Precinto {p}</b>
+
+"
     for c in found:
-        msg += format_cliente(c) + "\n"
+        msg += format_cliente(c) + "
+"
     await update.message.reply_text(msg[:4000], parse_mode="HTML", disable_web_page_preview=True)
 
 async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("⚠️ Usá: <code>/historial 6331</code>", parse_mode="HTML")
         return
-    
+
     num = safe_str(context.args[0])
-    reclamos = ws_reclamos.get_all_records()
+    reclamos = get_cached_records(ws_reclamos, "reclamos")
     historial = [r for r in reclamos if safe_str(r.get("Nº Cliente")) == num]
-    
+
     if not historial:
         await update.message.reply_text(f"❌ Cliente <b>#{num}</b> no tiene reclamos.", parse_mode="HTML")
         return
-    
+
     historial = historial[-10:]
     historial.reverse()
-    msg = f"<b>📜 Historial completo — Cliente #{num}</b>\n\n"
+    msg = f"<b>📜 Historial completo — Cliente #{num}</b>
+
+"
     for i, r in enumerate(historial, 1):
-        msg += format_reclamo(r, i) + "\n"
-    
+        msg += format_reclamo(r, i) + "
+"
+
     if len(msg) > 4000:
-        msg = msg[:4000] + "\n\n<i>... mostrando últimos 10</i>"
+        msg = msg[:4000] + "
+
+<i>... mostrando últimos 10</i>"
     await update.message.reply_text(msg, parse_mode="HTML")
 
 async def ubicacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("⚠️ Usá: <code>/ubicacion 6331</code>", parse_mode="HTML")
         return
-    
+
     num = safe_str(context.args[0])
-    clientes = ws_clientes.get_all_records()
+    clientes = get_cached_records(ws_clientes, "clientes")
     cliente_row = next((c for c in clientes if safe_str(c.get("Nº Cliente")) == num), None)
-    
+
     if not cliente_row:
         await update.message.reply_text(f"❌ Cliente <b>#{num}</b> no encontrado.", parse_mode="HTML")
         return
-    
+
     lat = safe_str(cliente_row.get("Latitud"))
     lon = safe_str(cliente_row.get("Longitud"))
     nombre = safe_str(cliente_row.get("Nombre"))
     direccion = safe_str(cliente_row.get("Dirección"))
-    
+
     if lat and lon:
         maps_url = f"https://www.google.com/maps?q={lat},{lon}"
         msg = (
-            f"<b>📍 Cliente #{num} — {nombre}</b>\n"
-            f"{direccion}\n\n"
-            f"<a href='{maps_url}'>🗺️ Abrir Google Maps</a>\n\n"
-            f"<code>Lat:</code> {lat}\n<code>Lon:</code> {lon}"
+            f"<b>📍 Cliente #{num} — {nombre}</b>
+"
+            f"{direccion}
+
+"
+            f"<a href='{maps_url}'>🗺️ Abrir Google Maps</a>
+
+"
+            f"<code>Lat:</code> {lat}
+<code>Lon:</code> {lon}"
         )
     else:
-        msg = f"<b>📍 Cliente #{num} — {nombre}</b>\n\n<i>No tiene coordenadas cargadas.</i>"
+        msg = f"<b>📍 Cliente #{num} — {nombre}</b>
+
+<i>No tiene coordenadas cargadas.</i>"
     await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=False)
 
 async def reclamo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("⚠️ Usá: <code>/reclamo A64C13C0</code>", parse_mode="HTML")
         return
-    
+
     rid = safe_str(context.args[0])
-    reclamos = ws_reclamos.get_all_records()
+    reclamos = get_cached_records(ws_reclamos, "reclamos")
     found = [r for r in reclamos if safe_str(r.get("ID Reclamo")) == rid]
-    
+
     if not found:
         await update.message.reply_text(f"❌ Reclamo <code>{rid}</code> no encontrado.", parse_mode="HTML")
         return
-    
+
     r = found[0]
     msg = (
-        f"<b>📋 Reclamo {rid}</b>\n\n"
-        f"├ <b>Cliente:</b> #{safe_str(r.get('Nº Cliente'))} — {safe_str(r.get('Nombre'))}\n"
-        f"├ <b>Fecha:</b> {safe_str(r.get('Fecha y hora'))}\n"
-        f"├ <b>Tipo:</b> {safe_str(r.get('Tipo de reclamo'))}\n"
-        f"├ <b>Estado:</b> {safe_str(r.get('Estado'))}\n"
-        f"├ <b>Técnico:</b> {safe_str(r.get('Técnico')) or '—'}\n"
-        f"├ <b>Precinto:</b> {safe_str(r.get('N° de Precinto')) or '—'}\n"
-        f"├ <b>Dirección:</b> {safe_str(r.get('Dirección'))}\n"
-        f"├ <b>Teléfono:</b> {safe_str(r.get('Teléfono')) or '—'}\n"
-        f"└ <b>Detalle:</b> {safe_str(r.get('Detalles')) or '—'}\n"
+        f"<b>📋 Detalle del Reclamo</b>
+
+"
+        f"├ <b>Cliente:</b> #{safe_str(r.get('Nº Cliente'))} — {safe_str(r.get('Nombre'))}
+"
+        f"├ <b>Fecha:</b> {safe_str(r.get('Fecha y hora'))}
+"
+        f"├ <b>Tipo:</b> {safe_str(r.get('Tipo de reclamo'))}
+"
+        f"├ <b>Estado:</b> {safe_str(r.get('Estado'))}
+"
+        f"├ <b>Técnico:</b> {safe_str(r.get('Técnico')) or '—'}
+"
+        f"├ <b>Precinto:</b> {safe_str(r.get('N° de Precinto')) or '—'}
+"
+        f"├ <b>Dirección:</b> {safe_str(r.get('Dirección'))}
+"
+        f"├ <b>Teléfono:</b> {safe_str(r.get('Teléfono')) or '—'}
+"
+        f"└ <b>Detalle:</b> {safe_str(r.get('Detalles')) or '—'}
+"
     )
     await update.message.reply_text(msg, parse_mode="HTML")
-
-async def tecnico(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("⚠️ Usá: <code>/tecnico ROQUE</code>", parse_mode="HTML")
-        return
-    
-    nombre = " ".join(context.args)
-    reclamos = ws_reclamos.get_all_records()
-    found = [r for r in reclamos if nombre.lower() in safe_str(r.get("Técnico")).lower()]
-    
-    if not found:
-        await update.message.reply_text(f"❌ No hay reclamos asignados a <b>{nombre}</b>.", parse_mode="HTML")
-        return
-    
-    found = found[-5:]
-    found.reverse()
-    msg = f"<b>👷 Reclamos de {nombre}</b> ({len(found)} mostrados)\n\n"
-    for i, r in enumerate(found, 1):
-        msg += format_reclamo(r, i) + "\n"
-    await update.message.reply_text(msg[:4000], parse_mode="HTML")
-
-async def nombre_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("⚠️ Usá: <code>/nombre BENITEZ</code>", parse_mode="HTML")
-        return
-    
-    texto = " ".join(context.args).lower()
-    clientes = ws_clientes.get_all_records()
-    found = [c for c in clientes if texto in safe_str(c.get("Nombre")).lower()]
-    
-    if not found:
-        await update.message.reply_text(f"❌ No se encontró cliente con <b>{texto}</b>.", parse_mode="HTML")
-        return
-    
-    msg = f"<b>🔍 Resultados ({len(found)}):</b>\n\n"
-    for c in found[:5]:
-        msg += format_cliente(c) + "\n"
-    await update.message.reply_text(msg[:4000], parse_mode="HTML", disable_web_page_preview=True)
-
-async def recientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        n = int(context.args[0]) if context.args else 5
-    except ValueError:
-        n = 5
-    n = max(1, min(n, 20))
-    
-    reclamos = ws_reclamos.get_all_records()
-    ultimos = reclamos[-n:]
-    ultimos.reverse()
-    
-    msg = f"<b>📅 Últimos {n} reclamos:</b>\n\n"
-    for i, r in enumerate(ultimos, 1):
-        msg += format_reclamo(r, i) + "\n"
-    await update.message.reply_text(msg[:4000], parse_mode="HTML")
-
-# ==================== MAIN ====================
-def main():
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("cliente", cliente))
-    application.add_handler(CommandHandler("precinto", precinto))
-    application.add_handler(CommandHandler("historial", historial))
-    application.add_handler(CommandHandler("ubicacion", ubicacion))
-    application.add_handler(CommandHandler("reclamo", reclamo_cmd))
-    application.add_handler(CommandHandler("tecnico", tecnico))
-    application.add_handler(CommandHandler("nombre", nombre_cmd))
-    application.add_handler(CommandHandler("recientes", recientes))
-    
-    if os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_HOSTNAME"):
-        logger.info("🚀 Modo Render detectado. Iniciando servidor de health-check...")
-        threading.Thread(target=run_web_server, daemon=True).start()
-    
-    logger.info("🤖 Bot iniciado. Esperando mensajes...")
-    application.run_polling()
-
-if __name__ == "__main__":
-    main()

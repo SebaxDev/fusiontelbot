@@ -2,3 +2,4 @@ python-telegram-bot==21.4
 gspread==6.1.2
 google-auth==2.32.0
 flask==3.0.3
+matplotlib
