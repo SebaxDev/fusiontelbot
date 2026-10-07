@@ -7,6 +7,7 @@ import asyncio
 from datetime import datetime, timedelta
 from collections import Counter
 from io import BytesIO
+from functools import wraps
 from flask import Flask
 import gspread
 from google.oauth2.service_account import Credentials
@@ -17,6 +18,12 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 CACHE_TTL = int(os.environ.get("CACHE_TTL", 60))
+
+# Contraseña de seguridad (por defecto 142536)
+BOT_PASSWORD = os.environ.get("BOT_PASSWORD", "142536")
+
+# Lista en memoria de chats autorizados
+authorized_chats = set()
 
 # ==================== LOGGING ====================
 logging.basicConfig(
@@ -61,6 +68,7 @@ gc = get_google_client()
 sh = gc.open_by_key(SPREADSHEET_ID)
 ws_reclamos = sh.worksheet("Reclamos")
 ws_clientes = sh.worksheet("Clientes")
+ws_cajas = sh.worksheet("Cajas")
 
 # ==================== CACHE ====================
 _cache = {}
@@ -72,7 +80,12 @@ def get_sheet_data(sheet_name, force=False):
         return _cache[sheet_name]
 
     t0 = time.time()
-    ws = ws_reclamos if sheet_name == "Reclamos" else ws_clientes
+    if sheet_name == "Reclamos":
+        ws = ws_reclamos
+    elif sheet_name == "Clientes":
+        ws = ws_clientes
+    else:
+        ws = ws_cajas
 
     try:
         result = ws.spreadsheet.values_get(
@@ -101,16 +114,50 @@ def get_sheet_data(sheet_name, force=False):
     return data
 
 def force_refresh():
-    global sh, ws_reclamos, ws_clientes
+    global sh, ws_reclamos, ws_clientes, ws_cajas
     clear_cache()
     sh = gc.open_by_key(SPREADSHEET_ID)
     ws_reclamos = sh.worksheet("Reclamos")
     ws_clientes = sh.worksheet("Clientes")
+    ws_cajas = sh.worksheet("Cajas")
     logger.info("🔄 Spreadsheet reabierto forzando refresh")
 
 def clear_cache():
     _cache.clear()
     _cache_time.clear()
+
+# ==================== SEGURIDAD (MIDDLEWARE) ====================
+def requires_auth(func):
+    """Decorador para restringir el acceso solo a chats logueados."""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        if not update.message:
+            return
+            
+        chat_id = update.effective_chat.id
+        if chat_id not in authorized_chats:
+            await update.message.reply_text(
+                "⛔ <b>Acceso denegado.</b>\nNo estás autorizado para usar este bot. "
+                "Por favor, ingresá la contraseña usando:\n\n"
+                "<code>/login CONTRASEÑA</code>", 
+                parse_mode="HTML"
+            )
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando para ingresar la contraseña y autorizar el chat."""
+    if not context.args:
+        await update.message.reply_text("⚠️ Usá el formato: <code>/login CONTRASEÑA</code>", parse_mode="HTML")
+        return
+        
+    password = context.args[0]
+    if password == BOT_PASSWORD:
+        authorized_chats.add(update.effective_chat.id)
+        await update.message.reply_text("✅ <b>Acceso concedido.</b>\nYa podés utilizar todos los comandos del bot.", parse_mode="HTML")
+    else:
+        await update.message.reply_text("❌ Contraseña incorrecta.", parse_mode="HTML")
 
 # ==================== HELPERS ====================
 def safe_str(value):
@@ -171,6 +218,7 @@ def format_cliente(row):
     direccion = safe_str(row.get("Dirección"))
     telefono = safe_str(row.get("Teléfono"))
     precinto = safe_str(row.get("N° de Precinto"))
+    caja = safe_str(row.get("Caja NAP"))
     plan = safe_str(row.get("Plan"))
     sector = safe_str(row.get("Sector"))
     lat = safe_str(row.get("Latitud"))
@@ -181,6 +229,7 @@ def format_cliente(row):
     html += f"├ <b>Dirección:</b> {direccion}\n"
     html += f"├ <b>Teléfono:</b> {telefono or '—'}\n"
     html += f"├ <b>Precinto:</b> {precinto or 'No asignado'}\n"
+    html += f"├ <b>Caja NAP:</b> {caja or 'Sin caja'}\n"
     html += f"├ <b>Plan:</b> {plan or '—'}\n"
     html += f"├ <b>Sector:</b> {sector or '—'}\n"
     if lat and lon:
@@ -196,43 +245,29 @@ def format_reclamo(row, idx=None, show_cliente=True):
     tipo = safe_str(row.get("Tipo de reclamo"))
     estado = safe_str(row.get("Estado"))
     tecnico = safe_str(row.get("Técnico"))
-    detalles = safe_str(row.get("Detalles"))
-    num_cliente = safe_str(row.get("Nº Cliente"))
-    nombre = safe_str(row.get("Nombre"))
 
     html = f"<b>{pref}{fecha}</b> | {tipo}\n"
-    if show_cliente:
-        html += f"├ <b>Cliente:</b> #{num_cliente} — {nombre}\n"
     html += f"├ <b>Estado:</b> {estado or '—'}\n"
-    html += f"├ <b>Técnico:</b> {tecnico or '—'}\n"
-    if detalles:
-        html += f"└ <b>Detalle:</b> {detalles[:80]}{'...' if len(detalles) > 80 else ''}\n"
-    else:
-        html += f"└ <b>Detalle:</b> —\n"
+    html += f"└ <b>Técnico:</b> {tecnico or '—'}\n"
     return html
 
 # ==================== COMANDOS ====================
+@requires_auth
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "👋 <b>Bot de Reclamos — Fusión</b>\n\n"
         "Comandos disponibles:\n\n"
         "• <b>/cliente</b> &lt;número&gt; — Ficha del cliente + historial\n"
         "• <b>/precinto</b> &lt;número&gt; — Buscar cliente por precinto\n"
-        "• <b>/historial</b> &lt;número&gt; — Todos los reclamos de un cliente\n"
-        "• <b>/ubicacion</b> &lt;número&gt; — Link de Maps del cliente\n"
-        "• <b>/reclamo</b> &lt;ID&gt; — Buscar reclamo por ID\n"
-        "• <b>/tecnico</b> &lt;nombre&gt; — Reclamos de un técnico\n"
-        "• <b>/nombre</b> &lt;texto&gt; — Buscar cliente por nombre\n"
-        "• <b>/recientes</b> &lt;N&gt; — Últimos N reclamos\n"
-        "• <b>/resumen</b> — Resumen de hoy\n"
-        "• <b>/pendientes</b> — Lista completa de pendientes\n"
+        "• <b>/caja</b> &lt;numero&gt; — Info física y puertos activos\n"
+        "• <b>/resumen</b> — Resumen de la jornada de hoy\n"
         "• <b>/topmes</b> — Ranking técnicos últimos 30 días\n"
-        "• <b>/mapa</b> &lt;sector&gt; — Mapa de reclamos por sector\n"
         "• <b>/actualizar</b> — Forzar recarga de datos del Sheet\n\n"
         "Ejemplo: <code>/cliente 6331</code>"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
+@requires_auth
 async def actualizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🔄 <b>Actualizando datos...</b>", parse_mode="HTML")
     try:
@@ -240,6 +275,7 @@ async def actualizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(1)
         reclamos = get_sheet_data("Reclamos", force=True)
         clientes = get_sheet_data("Clientes", force=True)
+        cajas = get_sheet_data("Cajas", force=True)
 
         ahora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         respuesta = (
@@ -247,14 +283,16 @@ async def actualizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"├ <b>Fecha:</b> {ahora}\n"
             f"├ <b>Reclamos:</b> {len(reclamos)} registros\n"
             f"├ <b>Clientes:</b> {len(clientes)} registros\n"
+            f"├ <b>Cajas NAP:</b> {len(cajas)} registros\n"
             f"└ <b>Cache:</b> {CACHE_TTL}s\n\n"
-            f"<i>Ahora usá /resumen para ver datos frescos.</i>"
+            f"<i>Listo para consultar.</i>"
         )
         await msg.edit_text(respuesta, parse_mode="HTML")
     except Exception as e:
         logger.error(f"Error al actualizar: {e}")
         await msg.edit_text(f"❌ <b>Error al actualizar:</b> {e}", parse_mode="HTML")
 
+@requires_auth
 async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reclamos = get_sheet_data("Reclamos")
     hoy = datetime.now().date()
@@ -292,13 +330,9 @@ async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"└ <b>⏳ Pendientes:</b> {pendientes}\n"
     )
 
-    suma = resueltos + en_curso + pendientes
-    if suma != generados:
-        msg += f"\n⚠️ <i>Atención: {generados - suma} reclamo(s) con estado no reconocido. "
-        msg += f"Usá /actualizar antes de consultar.</i>"
-
     await update.message.reply_text(msg, parse_mode="HTML")
 
+@requires_auth
 async def cliente(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("⚠️ Usá: <code>/cliente 6331</code>", parse_mode="HTML")
@@ -319,7 +353,7 @@ async def cliente(update: Update, context: ContextTypes.DEFAULT_TYPE):
     historial.reverse()
 
     msg = format_cliente(cliente_row)
-    msg += f"\n<b>📋 Historial ({len(historial)} de {total_reclamos}):</b>\n\n"
+    msg += f"\n<b>📋 Últimos Reclamos ({len(historial)} de {total_reclamos}):</b>\n\n"
     if historial:
         for i, r in enumerate(historial, 1):
             msg += format_reclamo(r, i) + "\n"
@@ -328,6 +362,7 @@ async def cliente(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_long_message(update, msg, disable_web_page_preview=True)
 
+@requires_auth
 async def precinto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("⚠️ Usá: <code>/precinto 4209200</code>", parse_mode="HTML")
@@ -346,176 +381,65 @@ async def precinto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += format_cliente(c) + "\n"
     await send_long_message(update, msg[:4000], disable_web_page_preview=True)
 
-async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@requires_auth
+async def caja_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("⚠️ Usá: <code>/historial 6331</code>", parse_mode="HTML")
+        await update.message.reply_text("⚠️ Usá: <code>/caja 450</code>", parse_mode="HTML")
         return
 
-    num = safe_str(context.args[0])
-    reclamos = get_sheet_data("Reclamos")
-    historial = [r for r in reclamos if safe_str(r.get("Nº Cliente")) == num]
+    numero = safe_str(context.args[0])
+    cajas = get_sheet_data("Cajas")
+    caja_row = next((c for c in cajas if safe_str(c.get("N De Caja")) == numero), None)
 
-    if not historial:
-        await update.message.reply_text(f"❌ Cliente <b>#{num}</b> no tiene reclamos.", parse_mode="HTML")
+    if not caja_row:
+        await update.message.reply_text(f"❌ Caja NAP <b>{numero}</b> no encontrada en el sistema.", parse_mode="HTML")
         return
 
-    historial = historial[-10:]
-    historial.reverse()
-    msg = f"<b>📜 Historial completo — Cliente #{num}</b>\n\n"
-    for i, r in enumerate(historial, 1):
-        msg += format_reclamo(r, i) + "\n"
-
-    await send_long_message(update, msg)
-
-async def ubicacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("⚠️ Usá: <code>/ubicacion 6331</code>", parse_mode="HTML")
-        return
-
-    num = safe_str(context.args[0])
+    sector = safe_str(caja_row.get("Sector"))
+    barrio = safe_str(caja_row.get("Barrio"))
+    splitter = safe_str(caja_row.get("Splitter"))
+    lat = safe_str(caja_row.get("Latitud"))
+    lon = safe_str(caja_row.get("Longitud"))
+    
+    # Extraer puertos ocupados
+    precintos_caja = []
+    for i in range(1, 17):
+        p = safe_str(caja_row.get(f"Precinto {i}"))
+        if p:
+            precintos_caja.append((i, p))
+            
+    # Traer clientes para cruzar los datos
     clientes = get_sheet_data("Clientes")
-    cliente_row = next((c for c in clientes if safe_str(c.get("Nº Cliente")) == num), None)
+    clientes_dict = {safe_str(c.get("N° de Precinto")): c for c in clientes if safe_str(c.get("N° de Precinto"))}
 
-    if not cliente_row:
-        await update.message.reply_text(f"❌ Cliente <b>#{num}</b> no encontrado.", parse_mode="HTML")
-        return
-
-    lat = safe_str(cliente_row.get("Latitud"))
-    lon = safe_str(cliente_row.get("Longitud"))
-    nombre = safe_str(cliente_row.get("Nombre"))
-    direccion = safe_str(cliente_row.get("Dirección"))
+    # Armado del mensaje
+    msg = f"<b>📦 Caja NAP {numero}</b>\n\n"
+    msg += f"├ <b>Sector:</b> {sector or '—'}\n"
+    msg += f"├ <b>Barrio:</b> {barrio or '—'}\n"
+    msg += f"├ <b>Splitter:</b> {splitter or '—'}\n"
 
     if lat and lon:
         maps_url = f"https://www.google.com/maps?q={lat},{lon}"
-        msg = (
-            f"<b>📍 Cliente #{num} — {nombre}</b>\n"
-            f"{direccion}\n\n"
-            f"<a href='{maps_url}'>🗺️ Abrir Google Maps</a>\n\n"
-            f"<code>Lat:</code> {lat}\n<code>Lon:</code> {lon}"
-        )
+        msg += f"└ <b>📍 Ubicación:</b> <a href='{maps_url}'>Ver en Google Maps</a>\n\n"
     else:
-        msg = f"<b>📍 Cliente #{num} — {nombre}</b>\n\n<i>No tiene coordenadas cargadas.</i>"
-    await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=False)
+        msg += f"└ <b>📍 Ubicación:</b> No disponible\n\n"
 
-async def reclamo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("⚠️ Usá: <code>/reclamo A64C13C0</code>", parse_mode="HTML")
-        return
-
-    rid = safe_str(context.args[0])
-    reclamos = get_sheet_data("Reclamos")
-    found = [r for r in reclamos if safe_str(r.get("ID Reclamo")) == rid]
-
-    if not found:
-        await update.message.reply_text(f"❌ Reclamo <code>{rid}</code> no encontrado.", parse_mode="HTML")
-        return
-
-    r = found[0]
-    msg = (
-        f"<b>📋 Reclamo</b>\n\n"
-        f"├ <b>Cliente:</b> #{safe_str(r.get('Nº Cliente'))} — {safe_str(r.get('Nombre'))}\n"
-        f"├ <b>Fecha:</b> {safe_str(r.get('Fecha y hora'))}\n"
-        f"├ <b>Tipo:</b> {safe_str(r.get('Tipo de reclamo'))}\n"
-        f"├ <b>Estado:</b> {safe_str(r.get('Estado'))}\n"
-        f"├ <b>Técnico:</b> {safe_str(r.get('Técnico')) or '—'}\n"
-        f"├ <b>Precinto:</b> {safe_str(r.get('N° de Precinto')) or '—'}\n"
-        f"├ <b>Dirección:</b> {safe_str(r.get('Dirección'))}\n"
-        f"├ <b>Teléfono:</b> {safe_str(r.get('Teléfono')) or '—'}\n"
-        f"└ <b>Detalle:</b> {safe_str(r.get('Detalles')) or '—'}\n"
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-async def tecnico(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("⚠️ Usá: <code>/tecnico ROQUE</code>", parse_mode="HTML")
-        return
-
-    nombre = " ".join(context.args)
-    reclamos = get_sheet_data("Reclamos")
-    found = [r for r in reclamos if nombre.lower() in safe_str(r.get("Técnico")).lower()]
-
-    if not found:
-        await update.message.reply_text(f"❌ No hay reclamos asignados a <b>{nombre}</b>.", parse_mode="HTML")
-        return
-
-    en_curso = [r for r in found if safe_str(r.get("Estado")).lower() != "resuelto"]
-    verificados = [r for r in found if safe_str(r.get("Estado")).lower() == "resuelto"]
-
-    msg = f"<b>👷 Reclamos de {nombre}</b>\n\n"
-
-    if en_curso:
-        msg += f"<b>🔧 En curso ({len(en_curso)}):</b>\n\n"
-        for i, r in enumerate(en_curso[-10:], 1):
-            msg += format_reclamo(r, i) + "\n"
+    msg += f"<b>🔌 Puertos Ocupados ({len(precintos_caja)}):</b>\n"
+    if not precintos_caja:
+        msg += "<i>Todos los puertos están libres.</i>\n"
     else:
-        msg += "<b>🔧 En curso:</b> <i>Ninguno</i>\n\n"
+        for puerto, p_num in precintos_caja:
+            cli = clientes_dict.get(p_num)
+            if cli:
+                nombre = safe_str(cli.get('Nombre'))
+                nro_cli = safe_str(cli.get('Nº Cliente'))
+                msg += f"• <b>P{puerto}</b>: {p_num} 🟢 #{nro_cli} - {nombre}\n"
+            else:
+                msg += f"• <b>P{puerto}</b>: {p_num} 🔴 <i>Sin cliente en sistema</i>\n"
 
-    if verificados:
-        msg += f"<b>✅ Resueltos ({len(verificados)}):</b>\n\n"
-        for i, r in enumerate(verificados[-5:], 1):
-            msg += format_reclamo(r, i) + "\n"
-    else:
-        msg += "<b>✅ Resueltos:</b> <i>Ninguno</i>\n"
+    await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
 
-    await send_long_message(update, msg)
-
-async def nombre_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("⚠️ Usá: <code>/nombre BENITEZ</code>", parse_mode="HTML")
-        return
-
-    texto = " ".join(context.args).lower()
-    clientes = get_sheet_data("Clientes")
-    found = [c for c in clientes if texto in safe_str(c.get("Nombre")).lower()]
-
-    if not found:
-        await update.message.reply_text(f"❌ No se encontró cliente con <b>{texto}</b>.", parse_mode="HTML")
-        return
-
-    msg = f"<b>🔍 Resultados ({len(found)}):</b>\n\n"
-    for c in found[:5]:
-        msg += format_cliente(c) + "\n"
-    await send_long_message(update, msg[:4000], disable_web_page_preview=True)
-
-async def recientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        n = int(context.args[0]) if context.args else 5
-    except ValueError:
-        n = 5
-    n = max(1, min(n, 20))
-
-    reclamos = get_sheet_data("Reclamos")
-    ultimos = reclamos[-n:]
-    ultimos.reverse()
-
-    msg = f"<b>📅 Últimos {n} reclamos:</b>\n\n"
-    for i, r in enumerate(ultimos, 1):
-        msg += format_reclamo(r, i, show_cliente=True) + "\n"
-    await send_long_message(update, msg)
-
-async def pendientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reclamos = get_sheet_data("Reclamos")
-    pendientes_list = [r for r in reclamos if not tiene_tecnico(r) and safe_str(r.get("Estado")).lower() != "resuelto"]
-
-    if not pendientes_list:
-        await update.message.reply_text("✅ <b>No hay reclamos pendientes.</b>", parse_mode="HTML")
-        return
-
-    pendientes_list.sort(key=lambda x: parse_fecha(safe_str(x.get("Fecha y hora"))) or datetime.min, reverse=True)
-
-    msg = f"<b>⏳ Reclamos Pendientes ({len(pendientes_list)}):</b>\n\n"
-    for i, r in enumerate(pendientes_list, 1):
-        num = safe_str(r.get("Nº Cliente"))
-        nombre = safe_str(r.get("Nombre"))
-        direccion = safe_str(r.get("Dirección"))
-        tipo = safe_str(r.get("Tipo de reclamo"))
-        fecha = safe_str(r.get("Fecha y hora"))
-        msg += f"{i}. <b>#{num}</b> — {nombre}\n"
-        msg += f"   📍 {direccion}\n"
-        msg += f"   🏷️ {tipo} | 📅 {fecha}\n\n"
-
-    await send_long_message(update, msg)
-
+@requires_auth
 async def topmes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reclamos = get_sheet_data("Reclamos")
 
@@ -546,85 +470,29 @@ async def topmes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(msg, parse_mode="HTML")
 
-async def mapa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-    except ImportError:
-        await update.message.reply_text("⚠️ <b>Mapa no disponible:</b> falta instalar <code>matplotlib</code>.", parse_mode="HTML")
-        return
-
-    if not context.args:
-        await update.message.reply_text("⚠️ Usá: <code>/mapa 7</code>", parse_mode="HTML")
-        return
-
-    sector = safe_str(context.args[0])
-    reclamos = get_sheet_data("Reclamos")
-
-    puntos = []
-    for r in reclamos:
-        if safe_str(r.get("Sector")) != sector:
-            continue
-        lat = safe_str(r.get("Latitud"))
-        lon = safe_str(r.get("Longitud"))
-        if lat and lon:
-            try:
-                lat_f = float(lat)
-                lon_f = float(lon)
-                estado = safe_str(r.get("Estado"))
-                puntos.append((lat_f, lon_f, estado))
-            except ValueError:
-                continue
-
-    if not puntos:
-        await update.message.reply_text(f"❌ <b>Sector {sector}:</b> no hay coordenadas disponibles.", parse_mode="HTML")
-        return
-
-    fig, ax = plt.subplots(figsize=(10, 8))
-
-    for lat, lon, estado in puntos:
-        color = "green" if estado.lower() == "resuelto" else "orange" if estado else "red"
-        ax.plot(lon, lat, marker='o', color=color, markersize=8)
-
-    ax.set_title(f"Mapa Sector {sector} — {len(puntos)} puntos")
-    ax.set_xlabel("Longitud")
-    ax.set_ylabel("Latitud")
-    ax.grid(True)
-
-    buf = BytesIO()
-    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
-    buf.seek(0)
-    plt.close(fig)
-
-    await update.message.reply_photo(photo=buf, caption=f"🗺️ <b>Mapa Sector {sector}</b>\n{len(puntos)} puntos cargados.")
-
 # ==================== MAIN ====================
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_error_handler(error_handler)
 
+    # El login no lleva el decorador de auth
+    application.add_handler(CommandHandler("login", login))
+    
+    # Comandos seguros
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("cliente", cliente))
     application.add_handler(CommandHandler("precinto", precinto))
-    application.add_handler(CommandHandler("historial", historial))
-    application.add_handler(CommandHandler("ubicacion", ubicacion))
-    application.add_handler(CommandHandler("reclamo", reclamo_cmd))
-    application.add_handler(CommandHandler("tecnico", tecnico))
-    application.add_handler(CommandHandler("nombre", nombre_cmd))
-    application.add_handler(CommandHandler("recientes", recientes))
+    application.add_handler(CommandHandler("caja", caja_cmd))
     application.add_handler(CommandHandler("resumen", resumen))
-    application.add_handler(CommandHandler("pendientes", pendientes))
     application.add_handler(CommandHandler("topmes", topmes))
-    application.add_handler(CommandHandler("mapa", mapa))
     application.add_handler(CommandHandler("actualizar", actualizar))
 
     if os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_HOSTNAME"):
-        logger.info("🚀 Modo Render detectado. Iniciando servidor de health-check...")
+        logger.info("🚀 Modo Render detectado. Iniciando servidor web para health-check...")
         threading.Thread(target=run_web_server, daemon=True).start()
 
-    logger.info("🤖 Bot iniciado. Esperando mensajes...")
+    logger.info("🤖 Bot iniciado. Esperando comandos...")
     application.run_polling(
         drop_pending_updates=True,
         poll_interval=2.0
