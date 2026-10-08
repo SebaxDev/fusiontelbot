@@ -397,6 +397,7 @@ async def caja_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sector = safe_str(caja_row.get("Sector"))
     barrio = safe_str(caja_row.get("Barrio"))
+    marca = safe_str(caja_row.get("Marca Equipo"))
     splitter = safe_str(caja_row.get("Splitter"))
     lat = safe_str(caja_row.get("Latitud"))
     lon = safe_str(caja_row.get("Longitud"))
@@ -416,6 +417,7 @@ async def caja_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"<b>📦 Caja NAP {numero}</b>\n\n"
     msg += f"├ <b>Sector:</b> {sector or '—'}\n"
     msg += f"├ <b>Barrio:</b> {barrio or '—'}\n"
+    msg += f"├ <b>Marca Equipo:</b> {marca or '—'}\n"
     msg += f"├ <b>Splitter:</b> {splitter or '—'}\n"
 
     if lat and lon:
