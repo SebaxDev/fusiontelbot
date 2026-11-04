@@ -621,15 +621,33 @@ async def confirmar_guardado(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
 
+    # Extraemos el número de cliente antes para poder usarlo en los botones de regreso
+    nro_cliente = context.user_data.get('edit_cliente')
+
+    # Teclado estándar para volver a ofrecer opciones
+    teclado_continuar = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🏷️ Precinto", callback_data=f"edit_precinto_{nro_cliente}"),
+            InlineKeyboardButton("📦 Caja", callback_data=f"edit_caja_{nro_cliente}")
+        ],
+        [
+            InlineKeyboardButton("📍 Ubicación", callback_data=f"edit_geo_{nro_cliente}")
+        ]
+    ])
+
     if query.data == "conf_no":
-        await query.edit_message_text("❌ <b>Operación cancelada.</b> No se hicieron cambios.", parse_mode="HTML")
+        await query.edit_message_text(
+            f"❌ <b>Operación cancelada.</b> No se hicieron cambios en el cliente #{nro_cliente}.\n\n"
+            f"¿Querés editar algún otro dato?", 
+            parse_mode="HTML",
+            reply_markup=teclado_continuar
+        )
         context.user_data.clear()
         return ConversationHandler.END
 
     await query.edit_message_text("⏳ <b>Guardando cambios en el sistema...</b>\nPor favor, esperá un momento, esto puede tardar unos segundos.", parse_mode="HTML")
 
     accion = context.user_data.get('edit_accion')
-    nro_cliente = context.user_data.get('edit_cliente')
     nuevo_valor = context.user_data.get('nuevo_valor')
 
     clientes = get_sheet_data("Clientes")
@@ -639,7 +657,6 @@ async def confirmar_guardado(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("❌ Error crítico: No se encontró al cliente en la base de datos temporal.", parse_mode="HTML")
         return ConversationHandler.END
 
-    # Extraemos la fila exacta y reconstruimos el orden de las columnas para saber dónde escribir
     fila_cliente = cliente_row['_row_num']
     headers_clientes = [k for k in cliente_row.keys() if k != "_row_num"]
 
@@ -649,7 +666,6 @@ async def confirmar_guardado(update: Update, context: ContextTypes.DEFAULT_TYPE)
             col_lat = headers_clientes.index("Latitud") + 1
             col_lon = headers_clientes.index("Longitud") + 1
             
-            # Actualizamos las 2 celdas
             ws_clientes.update_cell(fila_cliente, col_lat, lat)
             ws_clientes.update_cell(fila_cliente, col_lon, lon)
 
@@ -658,10 +674,8 @@ async def confirmar_guardado(update: Update, context: ContextTypes.DEFAULT_TYPE)
             viejo_precinto = safe_str(cliente_row.get("N° de Precinto"))
             caja_actual = safe_str(cliente_row.get("Caja NAP"))
 
-            # 1. Actualizamos el precinto en la hoja del cliente
             ws_clientes.update_cell(fila_cliente, col_precinto, nuevo_valor)
 
-            # 2. Si tenía caja, vamos a la caja y reemplazamos el precinto viejo por el nuevo
             if caja_actual:
                 cajas = get_sheet_data("Cajas")
                 caja_row = next((c for c in cajas if safe_str(c.get("N De Caja")) == caja_actual), None)
@@ -669,24 +683,24 @@ async def confirmar_guardado(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     fila_caja = caja_row['_row_num']
                     headers_cajas = [k for k in caja_row.keys() if k != "_row_num"]
                     
-                    # Buscamos en qué puerto (1 al 16) estaba el precinto viejo
                     for i in range(1, 17):
                         col_name = f"Precinto {i}"
                         if safe_str(caja_row.get(col_name)) == viejo_precinto:
                             col_idx = headers_cajas.index(col_name) + 1
                             ws_cajas.update_cell(fila_caja, col_idx, nuevo_valor)
-                            break # Cortamos porque ya lo encontró y reemplazó
+                            break 
 
         elif accion == "caja":
             cajas = get_sheet_data("Cajas")
             caja_row = next((c for c in cajas if safe_str(c.get("N De Caja")) == nuevo_valor), None)
             
-            # Validación de tu idea: si la caja no existe en el sheet
             if not caja_row:
                 await query.edit_message_text(
                     f"❌ La caja <b>{nuevo_valor}</b> no está cargada en el sistema.\n\n"
-                    f"Pasale los datos de la caja a Seba (@mellamansebax) o Laura para que se agregue al sistema pronto.",
-                    parse_mode="HTML"
+                    f"Pasale los datos de la caja a Seba (@mellamansebax) o Laura para que se agregue al sistema pronto.\n\n"
+                    f"¿Qué más querés hacer con el cliente #{nro_cliente}?",
+                    parse_mode="HTML",
+                    reply_markup=teclado_continuar
                 )
                 return ConversationHandler.END
 
@@ -694,37 +708,45 @@ async def confirmar_guardado(update: Update, context: ContextTypes.DEFAULT_TYPE)
             fila_caja = caja_row['_row_num']
             headers_cajas = [k for k in caja_row.keys() if k != "_row_num"]
             
-            # Buscar el primer puerto libre de la caja (1 al 16)
             puerto_libre_idx = None
             for i in range(1, 17):
                 col_name = f"Precinto {i}"
-                if not safe_str(caja_row.get(col_name)): # Si la celda está vacía
+                if not safe_str(caja_row.get(col_name)):
                     puerto_libre_idx = headers_cajas.index(col_name) + 1
                     break
             
             if not puerto_libre_idx:
-                await query.edit_message_text(f"❌ La caja <b>{nuevo_valor}</b> está llena. No tiene puertos libres (1 al 16 ocupados).", parse_mode="HTML")
+                await query.edit_message_text(
+                    f"❌ La caja <b>{nuevo_valor}</b> está llena. No tiene puertos libres (1 al 16 ocupados).\n\n"
+                    f"¿Qué más querés hacer con el cliente #{nro_cliente}?",
+                    parse_mode="HTML",
+                    reply_markup=teclado_continuar
+                )
                 return ConversationHandler.END
 
-            # 1. Escribimos el precinto del cliente en el puerto libre de la Caja
             ws_cajas.update_cell(fila_caja, puerto_libre_idx, precinto_cliente)
             
-            # 2. Escribimos el número de caja en la hoja del Cliente
             col_caja = headers_clientes.index("Caja NAP") + 1
             ws_clientes.update_cell(fila_cliente, col_caja, nuevo_valor)
 
-        # ¡MUY IMPORTANTE! Limpiamos el caché local para que cuando pidan el cliente de nuevo, se descargue el Sheet actualizado
         clear_cache()
         
         await query.edit_message_text(
             f"✅ <b>¡Cambios guardados con éxito!</b>\n\n"
-            f"El cliente #{nro_cliente} y sus vinculaciones fueron actualizados correctamente en la base de datos.",
-            parse_mode="HTML"
+            f"El cliente #{nro_cliente} y sus vinculaciones fueron actualizados correctamente en la base de datos.\n\n"
+            f"¿Querés seguir editando a este cliente? (O buscá otro con <code>/cliente NUMERO</code>)",
+            parse_mode="HTML",
+            reply_markup=teclado_continuar
         )
         
     except Exception as e:
         logger.error(f"Error guardando en Sheets: {e}")
-        await query.edit_message_text(f"❌ <b>Error al comunicarse con Google Sheets:</b> {e}", parse_mode="HTML")
+        await query.edit_message_text(
+            f"❌ <b>Error al comunicarse con Google Sheets:</b> {e}\n\n"
+            f"Podés reintentar usando las opciones de abajo.", 
+            parse_mode="HTML",
+            reply_markup=teclado_continuar
+        )
         
     context.user_data.clear()
     return ConversationHandler.END
