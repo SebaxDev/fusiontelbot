@@ -11,8 +11,14 @@ from functools import wraps
 from flask import Flask
 import gspread
 from google.oauth2.service_account import Credentials
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes, 
+    ConversationHandler, CallbackQueryHandler, MessageHandler, filters
+)
+
+# Constantes de estados para la edición (ponelo justo debajo de los imports)
+ESPERANDO_DATO, CONFIRMANDO_CAMBIO = range(2)
 
 # ==================== CONFIGURACION ====================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -99,10 +105,13 @@ def get_sheet_data(sheet_name, force=False):
     if values and len(values) > 1:
         headers = [str(h).strip() if h else "" for h in values[0]]
         data = []
-        for row in values[1:]:
+        # Enumerate arranca en 0. +2 porque la fila 1 son los encabezados y Sheet empieza en 1.
+        for i, row in enumerate(values[1:]):
             record = {}
-            for i, header in enumerate(headers):
-                record[header] = row[i] if i < len(row) else ""
+            for j, header in enumerate(headers):
+                record[header] = row[j] if j < len(row) else ""
+            # Guardamos la fila real de Google Sheets de forma oculta
+            record["_row_num"] = i + 2 
             data.append(record)
     else:
         data = []
@@ -131,18 +140,24 @@ def requires_auth(func):
     """Decorador para restringir el acceso solo a chats logueados."""
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        if not update.message:
+        # Detectamos si es un mensaje de texto o el click de un botón interactivo
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        
+        if not chat_id:
             return
-            
-        chat_id = update.effective_chat.id
+
         if chat_id not in authorized_chats:
-            await update.message.reply_text(
+            mensaje_denegado = (
                 "⛔ <b>Acceso denegado.</b>\nNo estás autorizado para usar este bot. "
                 "Por favor, ingresá la contraseña usando:\n\n"
-                "<code>/login CONTRASEÑA</code>", 
-                parse_mode="HTML"
+                "<code>/login CONTRASEÑA</code>"
             )
+            if update.message:
+                await update.message.reply_text(mensaje_denegado, parse_mode="HTML")
+            elif update.callback_query:
+                await update.callback_query.answer("Acceso denegado.", show_alert=True)
             return
+            
         return await func(update, context, *args, **kwargs)
     return wrapper
 
@@ -360,7 +375,136 @@ async def cliente(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg += "<i>Sin reclamos registrados.</i>\n"
 
+    # Enviamos el historial largo primero
     await send_long_message(update, msg, disable_web_page_preview=True)
+
+    # === NUEVO: Botones interactivos para editar ===
+    teclado = [
+        [
+            InlineKeyboardButton("🏷️ Precinto", callback_data=f"edit_precinto_{num}"),
+            InlineKeyboardButton("📦 Caja", callback_data=f"edit_caja_{num}")
+        ],
+        [
+            InlineKeyboardButton("📍 Ubicación", callback_data=f"edit_geo_{num}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(teclado)
+
+    # Enviamos el menú de botones por separado al final
+    await update.message.reply_text(
+        f"⚙️ <b>Opciones para el Cliente #{num}:</b>", 
+        parse_mode="HTML", 
+        reply_markup=reply_markup
+    )
+
+@requires_auth
+async def boton_editar_cliente(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer() # Esto saca el "cargando..." del botón en Telegram
+    
+    # El callback_data viene con formato: edit_precinto_8520
+    _, accion, nro_cliente = query.data.split('_')
+    
+    # Guardamos en la memoria temporal del bot qué cliente y qué estamos editando
+    context.user_data['edit_cliente'] = nro_cliente
+    context.user_data['edit_accion'] = accion
+    
+    # Hacemos la validación si tocó "caja" (ver si tiene precinto)
+    if accion == "caja":
+        clientes = get_sheet_data("Clientes")
+        cliente_row = next((c for c in clientes if safe_str(c.get("Nº Cliente")) == nro_cliente), None)
+        precinto_actual = safe_str(cliente_row.get("N° de Precinto")) if cliente_row else ""
+        
+        if not precinto_actual:
+            await query.edit_message_text(
+                f"⚠️ <b>Atención:</b> El cliente #{nro_cliente} no tiene un precinto cargado.\n\n"
+                "Para poder asignarle una caja, <b>primero tenés que agregarle un precinto</b>.",
+                parse_mode="HTML"
+            )
+            # Cancelamos la operación acá porque no cumple el requisito
+            return ConversationHandler.END
+
+    # Si todo está bien (o si eligió otra opción), le pedimos el dato
+    if accion == "precinto":
+        texto = f"🏷️ <b>Editando Precinto (Cliente #{nro_cliente})</b>\n\nPor favor, escribí el <b>nuevo número de precinto</b> (tienen que ser 7 dígitos numéricos exactos)."
+    elif accion == "caja":
+        texto = f"📦 <b>Editando Caja (Cliente #{nro_cliente})</b>\n\nPor favor, escribí el <b>número de la caja NAP</b>."
+    elif accion == "geo":
+        texto = f"📍 <b>Editando Ubicación (Cliente #{nro_cliente})</b>\n\nTocá el 📎 (clip) acá en Telegram, seleccioná 'Ubicación' y enviame el punto exacto."
+        
+    # Reemplazamos los botones por el texto con la instrucción
+    await query.edit_message_text(text=texto, parse_mode="HTML")
+    
+    # Le decimos a Telegram: "Ahora quedate esperando a que escriba el dato"
+    return ESPERANDO_DATO
+
+@requires_auth
+async def recibir_dato_edicion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    accion = context.user_data.get('edit_accion')
+    nro_cliente = context.user_data.get('edit_cliente')
+    
+    # Si estamos esperando ubicación (GPS)
+    if accion == "geo":
+        if not update.message.location:
+            await update.message.reply_text("❌ Por favor, enviá una <b>ubicación válida</b> usando el 📎 clip de Telegram.", parse_mode="HTML")
+            return ESPERANDO_DATO
+            
+        lat = update.message.location.latitude
+        lon = update.message.location.longitude
+        nuevo_valor = f"{lat},{lon}" # Guardamos los dos juntos para procesarlos en el próximo paso
+        texto_mostrar = f"Latitud: {lat}\nLongitud: {lon}"
+        
+    # Si estamos esperando texto (Precinto o Caja)
+    else:
+        if not update.message.text:
+            await update.message.reply_text("❌ Por favor, escribí un texto válido.")
+            return ESPERANDO_DATO
+            
+        nuevo_valor = update.message.text.strip()
+        
+        # Validaciones específicas de Precinto
+        if accion == "precinto":
+            if not (nuevo_valor.isdigit() and len(nuevo_valor) == 7):
+                await update.message.reply_text("❌ El precinto debe tener <b>exactamente 7 dígitos numéricos</b>. Escribilo de nuevo:", parse_mode="HTML")
+                return ESPERANDO_DATO
+                
+            # Validar que no esté duplicado
+            clientes = get_sheet_data("Clientes")
+            duplicado = next((c for c in clientes if safe_str(c.get("N° de Precinto")) == nuevo_valor), None)
+            if duplicado:
+                nro_dup = safe_str(duplicado.get("Nº Cliente"))
+                await update.message.reply_text(f"❌ Ese precinto ya está asignado al cliente <b>#{nro_dup}</b>. Verificá y escribí otro número:", parse_mode="HTML")
+                return ESPERANDO_DATO
+                
+        texto_mostrar = nuevo_valor
+
+    # Guardamos los datos para usarlos cuando el técnico presione "SÍ"
+    context.user_data['nuevo_valor'] = nuevo_valor
+
+    # Armamos el mensaje de confirmación
+    texto_confirmacion = (
+        f"⚠️ <b>Confirmación de Cambio</b>\n\n"
+        f"👤 <b>Cliente:</b> #{nro_cliente}\n"
+        f"🔄 <b>Dato a editar:</b> {accion.upper()}\n"
+        f"✨ <b>Nuevo valor:</b> {texto_mostrar}\n\n"
+        f"¿Estás seguro de que querés guardar esto en el sistema?"
+    )
+
+    teclado_conf = [
+        [
+            InlineKeyboardButton("✅ SÍ, Guardar", callback_data="conf_si"),
+            InlineKeyboardButton("❌ NO, Cancelar", callback_data="conf_no")
+        ]
+    ]
+    
+    await update.message.reply_text(
+        texto_confirmacion, 
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(teclado_conf)
+    )
+    
+    # Cambiamos al estado de confirmación
+    return CONFIRMANDO_CAMBIO
 
 @requires_auth
 async def precinto(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -472,6 +616,125 @@ async def topmes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(msg, parse_mode="HTML")
 
+@requires_auth
+async def confirmar_guardado(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "conf_no":
+        await query.edit_message_text("❌ <b>Operación cancelada.</b> No se hicieron cambios.", parse_mode="HTML")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    await query.edit_message_text("⏳ <b>Guardando cambios en el sistema...</b>\nPor favor, esperá un momento, esto puede tardar unos segundos.", parse_mode="HTML")
+
+    accion = context.user_data.get('edit_accion')
+    nro_cliente = context.user_data.get('edit_cliente')
+    nuevo_valor = context.user_data.get('nuevo_valor')
+
+    clientes = get_sheet_data("Clientes")
+    cliente_row = next((c for c in clientes if safe_str(c.get("Nº Cliente")) == nro_cliente), None)
+    
+    if not cliente_row:
+        await query.edit_message_text("❌ Error crítico: No se encontró al cliente en la base de datos temporal.", parse_mode="HTML")
+        return ConversationHandler.END
+
+    # Extraemos la fila exacta y reconstruimos el orden de las columnas para saber dónde escribir
+    fila_cliente = cliente_row['_row_num']
+    headers_clientes = [k for k in cliente_row.keys() if k != "_row_num"]
+
+    try:
+        if accion == "geo":
+            lat, lon = nuevo_valor.split(",")
+            col_lat = headers_clientes.index("Latitud") + 1
+            col_lon = headers_clientes.index("Longitud") + 1
+            
+            # Actualizamos las 2 celdas
+            ws_clientes.update_cell(fila_cliente, col_lat, lat)
+            ws_clientes.update_cell(fila_cliente, col_lon, lon)
+
+        elif accion == "precinto":
+            col_precinto = headers_clientes.index("N° de Precinto") + 1
+            viejo_precinto = safe_str(cliente_row.get("N° de Precinto"))
+            caja_actual = safe_str(cliente_row.get("Caja NAP"))
+
+            # 1. Actualizamos el precinto en la hoja del cliente
+            ws_clientes.update_cell(fila_cliente, col_precinto, nuevo_valor)
+
+            # 2. Si tenía caja, vamos a la caja y reemplazamos el precinto viejo por el nuevo
+            if caja_actual:
+                cajas = get_sheet_data("Cajas")
+                caja_row = next((c for c in cajas if safe_str(c.get("N De Caja")) == caja_actual), None)
+                if caja_row:
+                    fila_caja = caja_row['_row_num']
+                    headers_cajas = [k for k in caja_row.keys() if k != "_row_num"]
+                    
+                    # Buscamos en qué puerto (1 al 16) estaba el precinto viejo
+                    for i in range(1, 17):
+                        col_name = f"Precinto {i}"
+                        if safe_str(caja_row.get(col_name)) == viejo_precinto:
+                            col_idx = headers_cajas.index(col_name) + 1
+                            ws_cajas.update_cell(fila_caja, col_idx, nuevo_valor)
+                            break # Cortamos porque ya lo encontró y reemplazó
+
+        elif accion == "caja":
+            cajas = get_sheet_data("Cajas")
+            caja_row = next((c for c in cajas if safe_str(c.get("N De Caja")) == nuevo_valor), None)
+            
+            # Validación de tu idea: si la caja no existe en el sheet
+            if not caja_row:
+                await query.edit_message_text(
+                    f"❌ La caja <b>{nuevo_valor}</b> no está cargada en el sistema.\n\n"
+                    f"Pasale los datos de la caja a Seba (@mellamansebax) o Laura para que se agregue al sistema pronto.",
+                    parse_mode="HTML"
+                )
+                return ConversationHandler.END
+
+            precinto_cliente = safe_str(cliente_row.get("N° de Precinto"))
+            fila_caja = caja_row['_row_num']
+            headers_cajas = [k for k in caja_row.keys() if k != "_row_num"]
+            
+            # Buscar el primer puerto libre de la caja (1 al 16)
+            puerto_libre_idx = None
+            for i in range(1, 17):
+                col_name = f"Precinto {i}"
+                if not safe_str(caja_row.get(col_name)): # Si la celda está vacía
+                    puerto_libre_idx = headers_cajas.index(col_name) + 1
+                    break
+            
+            if not puerto_libre_idx:
+                await query.edit_message_text(f"❌ La caja <b>{nuevo_valor}</b> está llena. No tiene puertos libres (1 al 16 ocupados).", parse_mode="HTML")
+                return ConversationHandler.END
+
+            # 1. Escribimos el precinto del cliente en el puerto libre de la Caja
+            ws_cajas.update_cell(fila_caja, puerto_libre_idx, precinto_cliente)
+            
+            # 2. Escribimos el número de caja en la hoja del Cliente
+            col_caja = headers_clientes.index("Caja NAP") + 1
+            ws_clientes.update_cell(fila_cliente, col_caja, nuevo_valor)
+
+        # ¡MUY IMPORTANTE! Limpiamos el caché local para que cuando pidan el cliente de nuevo, se descargue el Sheet actualizado
+        clear_cache()
+        
+        await query.edit_message_text(
+            f"✅ <b>¡Cambios guardados con éxito!</b>\n\n"
+            f"El cliente #{nro_cliente} y sus vinculaciones fueron actualizados correctamente en la base de datos.",
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error guardando en Sheets: {e}")
+        await query.edit_message_text(f"❌ <b>Error al comunicarse con Google Sheets:</b> {e}", parse_mode="HTML")
+        
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def cancelar_edicion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Permite al usuario salir de la edición escribiendo /cancelar."""
+    await update.message.reply_text("❌ <b>Edición cancelada por el usuario.</b>", parse_mode="HTML")
+    context.user_data.clear()
+    return ConversationHandler.END
+
 # ==================== MAIN ====================
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
@@ -489,6 +752,24 @@ def main():
     application.add_handler(CommandHandler("resumen", resumen))
     application.add_handler(CommandHandler("topmes", topmes))
     application.add_handler(CommandHandler("actualizar", actualizar))
+
+    # === NUEVO: ConversationHandler para edición ===
+    # Esto une los botones -> esperar respuesta -> confirmar -> guardar
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(boton_editar_cliente, pattern='^edit_')],
+        states={
+            ESPERANDO_DATO: [
+                MessageHandler(filters.LOCATION, recibir_dato_edicion),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_dato_edicion)
+            ],
+            CONFIRMANDO_CAMBIO: [
+                CallbackQueryHandler(confirmar_guardado, pattern='^conf_')
+            ]
+        },
+        fallbacks=[CommandHandler('cancelar', cancelar_edicion)],
+        per_message=False
+    )
+    application.add_handler(conv_handler)
 
     if os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_HOSTNAME"):
         logger.info("🚀 Modo Render detectado. Iniciando servidor web para health-check...")
